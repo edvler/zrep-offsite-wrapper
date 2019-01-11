@@ -1,0 +1,215 @@
+#!/bin/ksh
+
+# Tool locations
+ZREP=/usr/local/bin/zrep
+ZFS=zfs
+ZPOOL=zpool
+
+# Define colors
+NORM="\033[0m"
+RED="\033[0;31m"
+GREEN="\033[0;32m"
+BLUE="\033[0;34m"
+
+C_SECTION=$BLUE
+C_ERROR=$RED
+C_OK=$GREEN
+
+source=$1
+
+LOGDIR=/b01/offs/sysinfos/zrep-offsite-wrapper
+DATE=$(date +%Y%m%d_%H%M%S_%N)
+LOGFILE=$LOGDIR/logfile_$DATE.log
+
+if [ ! -d $LOGDIR ]; then
+    mkdir -p $LOGDIR
+fi
+
+set -o pipefail
+
+echo -e "
+${GREEN}################################################${NORM}
+
+ Starting zrep-offsite-wrapper
+ 
+ Author   | Matthias Maderer
+ Email    | edvler@edvler-blog.de
+ Website  | https://www.edvler-blog.de
+
+${GREEN}################################################${NORM}
+" 2>&1 | tee -a $LOGFILE
+
+
+# Scan for devices first
+#
+# This is needed if the device was deleted with
+# echo 1 > /sys/block/DEVICE-NBAME/device/delete
+echo -e "${C_SECTION}Task: Scanning for SCSI devices${NORM}" 2>&1 | tee -a $LOGFILE
+rescan-scsi-bus 2>&1 | tee -a $LOGFILE
+
+# Current ZREP status
+echo -e "${C_SECTION}Task: Show all zrep synced datasets${NORM}" 2>&1 | tee -a $LOGFILE
+$ZREP list -v
+
+# Error message function to give user a clear signal if something went wrong
+_exit_error(){
+	echo -e "
+	${RED}################################################
+
+	Status: ERROR! Don't remove your harddisk!
+
+	################################################${NORM}
+	" 2>&1 | tee -a $LOGFILE
+
+	exit 1
+}
+
+
+# Function to check if a zpool is imported
+_check_pools() {
+	# Get active zpools
+	cmd="$ZPOOL list | sed -e '1d' | awk '{print \$1}' | tr '\n' ' '"
+	zpools_active=( $(eval $cmd) )
+
+	foundpool=1 #Exit status 1
+	for zpool_active in ${zpools_active[@]};
+	do
+		if [[ $zpool_active = "$destpool" ]]; then
+			foundpool=0 #Exit status 0
+		fi
+	;
+	done
+
+	return $foundpool #return exit status
+}
+
+# Function which calls zrep
+_run_zrep(){
+	source=$1
+
+	# Start zrep
+	echo -e "${C_SECTION}Task: Starting zrep for source $source and tag $tag to $destfs${NORM}" 2>&1 | tee -a $LOGFILE
+
+	export DEBUG=1 #More Ourput
+	export ZREP_R=-R #Recursive
+	export ZREP_VERBOSE=yes #More Output
+	export ZREP_FORCE=-f #Rollback to last snapshot if backupvolume was modified and delete snapshots which does noc exists in the source filesystem
+
+	$ZREP sync $source 2>&1 | tee -a $LOGFILE
+
+	if [[ $? -ne 0 ]]; then
+	        echo -e "${C_ERROR}ERROR - ZREP returned not 0.${NORM}" 2>&1 | tee -a $LOGFILE
+	        _exit_error
+	fi
+
+	echo -e "${C_OK}OK - zrep exited with 0${NORM}" 2>&1 | tee -a $LOGFILE
+
+	# Export ZFS-Pool
+	echo -e "${C_SECTION}Task: exporting ZFS-Pool $destpool${NORM}" 2>&1 | tee -a $LOGFILE
+	$ZPOOL export $destpool
+
+	_check_pools
+	if [[ $? -eq 0 ]]; then #if pool is found something is wrong
+        	echo -e "${C_ERROR}ERROR - ZFS-Pool $destpool NOT exported${NORM}" 2>&1 | tee -a $LOGFILE
+	        _exit_error
+	fi	
+        
+	echo -e "${C_OK}OK - FS-Pool $destpool exported successfully${NORM}" 2>&1 | tee -a $LOGFILE
+
+	echo -e "${C_SECTION}TASK: Last synchronisation:${NORM}" 2>&1 | tee -a $LOGFILE
+	$ZREP status 2>&1 | tee -a $LOGFILE
+
+	#echo 1 > /sys/block/sdf/device/delete
+
+	return 0
+}
+
+# Get all ZREP tags of the source
+zrep_tags=( $(zfs get all $source | grep dest-fs | awk '{print $2}' | sed s/:dest-fs//gi | sort | uniq) )
+
+if [ -z "$zrep_tags" ]; then
+        echo -e "${C_ERROR}ERROR - No ZREP tags found${NORM}" 2>&1 | tee -a $LOGFILE
+	_exit_error
+fi
+
+typeset -Z6 zrep_ok_count
+zrep_ok_count=0
+
+# For each ZREP tag
+for tag in ${zrep_tags[@]};
+do
+	echo "" 2>&1 | tee -a $LOGFILE
+        # Check if the given dataset and tag is initialized with zrep
+        echo -e "${C_SECTION}Task: Check if dataset $source with tag $tag is ZREP initialized:${NORM}" 2>&1 | tee -a $LOGFILE
+	export ZREPTAG=$tag
+
+	# Get only first column and trim
+        cmd="$ZREP status | awk '{print \$1}' | tr '\n' ' '"
+        zrep_active=( $(eval $cmd) )
+
+        foundzrep=1
+        for zrep_ds in ${zrep_active[@]};
+        do
+                if [[ $zrep_ds = "$source" ]]; then
+                        foundzrep=0
+                fi
+        ;
+        done
+
+        if [[ $foundzrep -ne 0 ]]; then
+                echo -e "${C_ERROR}ERROR - Given source $source with tag $tag is not inititalized with zrep${NORM}" 2>&1 | tee -a $LOGFILE
+                _exit_error
+        fi
+
+        echo -e "${C_OK}OK - source $source with $tag is intitalized with zrep${NORM}" 2>&1 | tee -a $LOGFILE
+
+        # Check if destionation ZFS-Pool is imported
+        destfs=$(zfs get -H -o value ${ZREPTAG}:dest-fs $source)
+        destpool=$(echo $destfs | cut -d'/' -f1)
+        echo -e "${C_SECTION}Task: Check if destination ZFS-Pool $destpool is avaliable${NORM}" 2>&1 | tee -a $LOGFILE
+
+	# Check if ZFS-Pool is already imported, if not try to import
+        _check_pools
+        if [[ $? -eq 1 ]]; then
+                echo -e "ZFS-Pool $destpool not avaliable. Trying to import ..." 2>&1 | tee -a $LOGFILE
+                $ZPOOL import $destpool
+        fi
+
+	# Check again if ZFS-Pool now exists
+        _check_pools
+	exitpool=$?
+
+	# If ZFS-Pool not exists try next Tag ...
+        if [[ $exitpool -eq 1 ]]; then
+		echo -e "ZFS-Pool $destpool not avaliable. Trying next ZREP tag ..." 2>&1 | tee -a $LOGFILE
+        fi
+
+	# If ZFS-Pool exists, run ZREP!
+        if [[ $exitpool -eq 0 ]]; then
+        	echo -e "${C_OK}OK - ZFS-Pool $destpool is avaliable${NORM}" 2>&1 | tee -a $LOGFILE
+
+		_run_zrep "$source"
+
+		# Ony increment counter if _run_zrep return 0
+	        if [[ $? -eq 0 ]]; then
+			((zrep_ok_count=zrep_ok_count+1))
+        	fi
+        fi
+;
+done
+
+# If _run_zrep successfull count = 0 something went wrong
+if [[ $zrep_ok_count -eq 0 ]]; then
+	_exit_error
+fi
+
+# If _run_zrep successfull count > 0 at least one ZFS-Dataset was synchronized
+if [[ $zrep_ok_count -gt 0 ]]; then
+        echo -e "
+        ${GREEN}################################################
+
+        Synchronzied $source to external harddisk(s)
+
+        ################################################${NORM}
+        " 2>&1 | tee -a $LOGFILE
+fi
